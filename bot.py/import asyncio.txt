@@ -1,0 +1,469 @@
+import asyncio
+import logging
+import os
+import threading
+from datetime import datetime, timedelta, time
+from typing import Dict, List, Optional
+import sqlite3
+from contextlib import contextmanager
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+import aioschedule
+from flask import Flask
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Токен берется из переменных окружения (это безопасно!)
+API_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
+if not API_TOKEN:
+    logger.error("TELEGRAM_TOKEN не найден в переменных окружения!")
+    API_TOKEN = "ТВОЙ_ТОКЕН_ЗДЕСЬ"  # Запасной вариант, но лучше настроить переменные
+
+# Время ежедневной рассылки
+DAILY_TASK_TIME = time(9, 0)
+WORKING_DAYS = 30
+
+# ========== БАЗА ДАННЫХ ==========
+class Database:
+    def __init__(self, db_name='task_bot.db'):
+        self.db_name = db_name
+        self.init_db()
+    
+    @contextmanager
+    def get_connection(self):
+        conn = sqlite3.connect(self.db_name)
+        try:
+            yield conn
+        finally:
+            conn.close()
+    
+    def init_db(self):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    start_date TEXT,
+                    end_date TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    notification_time TEXT
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS daily_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    task_text TEXT,
+                    day_number INTEGER,
+                    created_at TEXT,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS task_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    day_number INTEGER,
+                    completed_tasks TEXT,
+                    failed_tasks TEXT,
+                    report_date TEXT,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            conn.commit()
+    
+    def add_user(self, user_id, username, first_name):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT user_id FROM users WHERE user_id = ?', (user_id,))
+            if cursor.fetchone():
+                return False
+            start_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            end_date = (datetime.now() + timedelta(days=WORKING_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute('''
+                INSERT INTO users (user_id, username, first_name, start_date, end_date, notification_time)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (user_id, username, first_name, start_date, end_date, '09:00'))
+            conn.commit()
+            return True
+    
+    def get_user(self, user_id):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+            return cursor.fetchone()
+    
+    def deactivate_user(self, user_id):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('UPDATE users SET is_active = 0 WHERE user_id = ?', (user_id,))
+            conn.commit()
+    
+    def get_active_users(self):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT user_id FROM users WHERE is_active = 1')
+            return [row[0] for row in cursor.fetchall()]
+    
+    def save_daily_tasks(self, user_id, tasks_text, day_number):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute('''
+                INSERT INTO daily_tasks (user_id, task_text, day_number, created_at)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, tasks_text, day_number, created_at))
+            conn.commit()
+            return cursor.lastrowid
+    
+    def get_today_tasks(self, user_id, day_number):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT task_text FROM daily_tasks 
+                WHERE user_id = ? AND day_number = ?
+                ORDER BY id DESC LIMIT 1
+            ''', (user_id, day_number))
+            result = cursor.fetchone()
+            return result[0] if result else None
+    
+    def save_report(self, user_id, day_number, completed, failed):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            report_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute('''
+                INSERT INTO task_reports (user_id, day_number, completed_tasks, failed_tasks, report_date)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (user_id, day_number, completed, failed, report_date))
+            conn.commit()
+    
+    def get_user_day_number(self, user_id):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT start_date FROM users WHERE user_id = ?', (user_id,))
+            start_date_str = cursor.fetchone()
+            if not start_date_str:
+                return 0
+            start_date = datetime.strptime(start_date_str[0], '%Y-%m-%d %H:%M:%S')
+            today = datetime.now()
+            day_number = (today - start_date).days + 1
+            if day_number > WORKING_DAYS:
+                return WORKING_DAYS + 1
+            return day_number
+    
+    def check_user_expired(self, user_id):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT end_date FROM users WHERE user_id = ?', (user_id,))
+            end_date_str = cursor.fetchone()
+            if not end_date_str:
+                return True
+            end_date = datetime.strptime(end_date_str[0], '%Y-%m-%d %H:%M:%S')
+            return datetime.now() >= end_date
+
+db = Database()
+
+# ========== КЛАВИАТУРЫ И СОСТОЯНИЯ ==========
+class TaskStates(StatesGroup):
+    waiting_for_tasks = State()
+    waiting_for_report = State()
+    waiting_for_failed = State()
+
+def get_main_keyboard():
+    builder = ReplyKeyboardBuilder()
+    builder.add(KeyboardButton(text="📝 Добавить задачи на сегодня"))
+    builder.add(KeyboardButton(text="📊 Отчет о выполнении"))
+    builder.add(KeyboardButton(text="ℹ️ Мой прогресс"))
+    builder.adjust(1)
+    return builder.as_markup(resize_keyboard=True)
+
+def get_yes_no_keyboard():
+    builder = ReplyKeyboardBuilder()
+    builder.add(KeyboardButton(text="✅ Да"))
+    builder.add(KeyboardButton(text="❌ Нет"))
+    builder.adjust(2)
+    return builder.as_markup(resize_keyboard=True)
+
+bot = Bot(token=API_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
+@dp.message(Command('start'))
+async def cmd_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+    
+    is_new = db.add_user(user_id, username, first_name)
+    
+    if is_new:
+        welcome_text = (
+            f"👋 Привет, {first_name}! Я твой персональный бот-мотиватор на 30 дней!\n\n"
+            f"📅 Каждый день в 9:00 я буду присылать тебе список задач.\n"
+            f"📝 Вечером ты сможешь отметить, что выполнил, а что нет.\n"
+            f"🎉 Я буду тебя хвалить за успехи!\n\n"
+            f"Через {WORKING_DAYS} дней наше путешествие закончится, и я попрощаюсь."
+        )
+        await message.answer(welcome_text, reply_markup=get_main_keyboard())
+    else:
+        if db.check_user_expired(user_id):
+            await message.answer(
+                "😔 Срок моей работы для тебя истек. Спасибо, что был со мной эти 30 дней!\n"
+                "Если хочешь начать заново, напиши /restart"
+            )
+        else:
+            await message.answer(
+                f"С возвращением, {first_name}! Продолжаем наше 30-дневное путешествие!",
+                reply_markup=get_main_keyboard()
+            )
+
+@dp.message(Command('restart'))
+async def cmd_restart(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    db.deactivate_user(user_id)
+    db.add_user(
+        user_id,
+        message.from_user.username,
+        message.from_user.first_name
+    )
+    await message.answer(
+        "🔄 Отлично! Я перезапустил для тебя 30-дневный цикл.\n"
+        "Жди заданий завтра в 9:00!",
+        reply_markup=get_main_keyboard()
+    )
+
+@dp.message(F.text == "📝 Добавить задачи на сегодня")
+async def add_tasks(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    if db.check_user_expired(user_id):
+        await message.answer(
+            "😔 Срок моей работы для тебя истек. Чтобы начать заново, используй /restart"
+        )
+        return
+    
+    day_number = db.get_user_day_number(user_id)
+    if day_number > WORKING_DAYS:
+        await message.answer(
+            "🎉 Твой 30-дневный марафон завершен! Спасибо за участие!\n"
+            "Используй /restart, чтобы начать заново."
+        )
+        return
+    
+    await state.set_state(TaskStates.waiting_for_tasks)
+    await message.answer(
+        f"📝 День {day_number}\n\n"
+        f"Напиши список задач на сегодня (каждую задачу с новой строки):",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+@dp.message(TaskStates.waiting_for_tasks)
+async def process_tasks(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    tasks_text = message.text
+    day_number = db.get_user_day_number(user_id)
+    db.save_daily_tasks(user_id, tasks_text, day_number)
+    await state.clear()
+    await message.answer(
+        "✅ Задачи сохранены! Удачи с их выполнением!\n"
+        "Вечером не забудь отправить отчет.",
+        reply_markup=get_main_keyboard()
+    )
+
+@dp.message(F.text == "📊 Отчет о выполнении")
+async def start_report(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    day_number = db.get_user_day_number(user_id)
+    tasks = db.get_today_tasks(user_id, day_number)
+    
+    if not tasks:
+        await message.answer(
+            "📝 Сначала добавь задачи на сегодня через кнопку 'Добавить задачи на сегодня'"
+        )
+        return
+    
+    await state.set_state(TaskStates.waiting_for_report)
+    await state.update_data(day_number=day_number, tasks=tasks)
+    
+    await message.answer(
+        f"📊 Отчет за день {day_number}\n\n"
+        f"Твои задачи на сегодня:\n{tasks}\n\n"
+        f"Какие задачи ты выполнил? Напиши их:",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+@dp.message(TaskStates.waiting_for_report)
+async def process_report(message: types.Message, state: FSMContext):
+    user_data = await state.get_data()
+    
+    if 'completed' not in user_data:
+        day_number = user_data['day_number']
+        completed = message.text
+        await state.update_data(completed=completed)
+        await state.set_state(TaskStates.waiting_for_failed)
+        await message.answer(
+            "❓ Были ли задачи, которые ты не выполнил? Если да, напиши их (или 'нет'):"
+        )
+    else:
+        await message.answer("Пожалуйста, ответь на вопрос о невыполненных задачах.")
+
+@dp.message(TaskStates.waiting_for_failed)
+async def process_failed(message: types.Message, state: FSMContext):
+    user_data = await state.get_data()
+    user_id = message.from_user.id
+    day_number = user_data['day_number']
+    completed = user_data['completed']
+    failed = message.text if message.text.lower() != 'нет' else 'нет невыполненных'
+    
+    db.save_report(user_id, day_number, completed, failed)
+    
+    # Похвала
+    if failed == 'нет невыполненных':
+        praise = "Потрясающе! Ты выполнил все задачи! 🎉 Ты настоящий герой продуктивности! 🌟"
+    else:
+        praises = [
+            f"Молодец! Ты выполнил: {completed}. В следующий раз обязательно справишься и с остальными! 💪",
+            f"Отличная работа! Выполнено: {completed}. Даже если не всё получилось, ты двигаешься вперед! 🚀",
+            f"Хороший день! Ты сделал: {completed}. Продолжай в том же духе! ✨"
+        ]
+        import random
+        praise = random.choice(praises)
+    
+    await state.clear()
+    await message.answer(
+        f"🌟 {praise}\n\n"
+        f"Ты отлично поработал сегодня! Завтра новый день и новые задачи.",
+        reply_markup=get_main_keyboard()
+    )
+
+@dp.message(F.text == "ℹ️ Мой прогресс")
+async def show_progress(message: types.Message):
+    user_id = message.from_user.id
+    user = db.get_user(user_id)
+    if not user:
+        await message.answer("Напиши /start, чтобы начать работу со мной!")
+        return
+    
+    start_date = datetime.strptime(user[3], '%Y-%m-%d %H:%M:%S')
+    end_date = datetime.strptime(user[4], '%Y-%m-%d %H:%M:%S')
+    current_day = (datetime.now() - start_date).days + 1
+    if current_day > WORKING_DAYS:
+        current_day = WORKING_DAYS
+    
+    progress_text = (
+        f"📊 Твой прогресс:\n\n"
+        f"📅 День {current_day} из {WORKING_DAYS}\n"
+        f"▶️ Начал: {start_date.strftime('%d.%m.%Y')}\n"
+        f"⏹️ Закончишь: {end_date.strftime('%d.%m.%Y')}\n"
+        f"✨ Осталось дней: {WORKING_DAYS - current_day}\n\n"
+    )
+    
+    progress_bar = "█" * current_day + "░" * (WORKING_DAYS - current_day)
+    progress_text += f"Прогресс: {progress_bar}"
+    
+    await message.answer(progress_text)
+
+# ========== ФУНКЦИИ ДЛЯ ЕЖЕДНЕВНОЙ РАССЫЛКИ ==========
+async def send_daily_tasks():
+    active_users = db.get_active_users()
+    for user_id in active_users:
+        try:
+            if db.check_user_expired(user_id):
+                await bot.send_message(
+                    user_id,
+                    "🎉 Поздравляю! Ты успешно прошел 30-дневный марафон!\n"
+                    "Было здорово работать с тобой! Желаю тебе дальнейших успехов!\n"
+                    "Если захочешь повторить, используй /restart\n\n"
+                    "👋 До свидания!"
+                )
+                db.deactivate_user(user_id)
+                continue
+            
+            day_number = db.get_user_day_number(user_id)
+            existing_tasks = db.get_today_tasks(user_id, day_number)
+            
+            if not existing_tasks:
+                await bot.send_message(
+                    user_id,
+                    f"🌅 Доброе утро! Наступил день {day_number} из {WORKING_DAYS}.\n\n"
+                    f"Не забудь добавить задачи на сегодня через кнопку ниже!",
+                    reply_markup=get_main_keyboard()
+                )
+            else:
+                await bot.send_message(
+                    user_id,
+                    f"🌅 Доброе утро! Наступил день {day_number} из {WORKING_DAYS}.\n\n"
+                    f"Твои задачи на сегодня:\n{existing_tasks}\n\n"
+                    f"Удачи с выполнением! Вечером жду отчет.",
+                    reply_markup=get_main_keyboard()
+                )
+        except Exception as e:
+            logger.error(f"Ошибка при отправке пользователю {user_id}: {e}")
+
+async def check_expired_users():
+    active_users = db.get_active_users()
+    for user_id in active_users:
+        if db.check_user_expired(user_id):
+            try:
+                await bot.send_message(
+                    user_id,
+                    "👋 Наше 30-дневное путешествие подошло к концу!\n\n"
+                    "Я прощаюсь с тобой, но надеюсь, что привычка планировать день останется с тобой навсегда.\n"
+                    "Если захочешь пройти марафон заново, используй команду /restart\n\n"
+                    "Всего доброго! ✨"
+                )
+                db.deactivate_user(user_id)
+            except Exception as e:
+                logger.error(f"Ошибка при прощании с пользователем {user_id}: {e}")
+
+async def scheduler():
+    aioschedule.every().day.at(DAILY_TASK_TIME.strftime('%H:%M')).do(send_daily_tasks)
+    aioschedule.every().hour.do(check_expired_users)
+    while True:
+        await aioschedule.run_pending()
+        await asyncio.sleep(60)
+
+async def main():
+    logger.info("Запуск бота...")
+    asyncio.create_task(scheduler())
+    logger.info("Планировщик задач запущен")
+    await dp.start_polling(bot)
+
+def run_bot():
+    """Функция для запуска бота в отдельном потоке"""
+    asyncio.run(main())
+
+# ========== FLASK-СЕРВЕР ДЛЯ RENDER ==========
+# Render требует, чтобы веб-сервис слушал порт и отвечал на HTTP-запросы
+# Иначе он выдаст ошибку "No open ports detected" [citation:7]
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "✅ Бот-мотиватор работает! Он принимает сообщения в Telegram."
+
+@app.route('/health')
+def health():
+    """Endpoint для проверки здоровья - Render его постоянно пингует"""
+    return "OK", 200
+
+# Запускаем бота в фоновом потоке при старте Flask-приложения
+thread = threading.Thread(target=run_bot, daemon=True)
+thread.start()
+
+# Эта часть выполняется, когда файл запускают напрямую
+if __name__ == '__main__':
+    # Запускаем Flask-сервер на порту, который даст Render [citation:2]
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
